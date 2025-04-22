@@ -1,396 +1,236 @@
 ---
-title: "COVID-19 Data Analysis"
+title: "NYPD Shooting Incident Analysis"
 author: "Anonymous"
 date: "2025-04-20"
 output:
   pdf_document: default
+  html_document: default
 ---
 
-## Objective
+## Objectives
 
-I will use the following data sets from Johns Hopkins University to analyze data pertaining to the COVID-19 pandemic. My objective is to answer the questions below, is well as using an ARIMA model to predict COVID-19 deaths in the US during the first quarter of 2023. 1. Which US state's population was most affected by the COVID-19 virus? 2. How did the United State's mortality rate compare to the rest of the world?
+I will use the following data sets published by the City of New York to analyze shooting incident data. My objective is to answer the questions below.
+
+1.  Which borough had the highest shooting mortality rate?
+2.  Which borough experienced the most gun violence relative to population?
+3.  Can we predict 2023 shootings using an ARIMA model?
 
 ## Data Overview
 
-First, I will import the necessary libraries and import the COVID19 and population data from the five JHU csv files.
+First, I will import the necessary libraries and read in the NYC shooting incident and population data from the below sources.
 
 ```{r import_libraries, message = 'hide'}
 library("tidyverse")
 library("dplyr")
+library("ggrepel")
 library("lubridate")
 library("forecast")
 library("tseries")
-
 ```
 
-```{r get_jhu_data}
+```{r get_data, message = FALSE}
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+nypd_data <- read_csv(url)
 
-#import JHU csv files
-url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
-file_names <- c("time_series_covid19_confirmed_US.csv",
-                "time_series_covid19_confirmed_global.csv",
-                "time_series_covid19_deaths_US.csv",
-                "time_series_covid19_deaths_global.csv")
-urls <- str_c(url_in, file_names)
+url2 <- "https://data.cityofnewyork.us/api/views/xywu-7bv9/rows.csv?accessType=DOWNLOAD"
+pop_data <- read_csv(url2)
 
-uid_lookup_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+summary(nypd_data)
+head(pop_data)
 ```
 
-Now I will read in the data and take an initial look at it.
-
-```{r import_data, message=FALSE}
-
-#read in JHU csv files
-us_cases <- read_csv(urls[1])
-global_cases <- read_csv(urls[2])
-us_deaths <- read_csv(urls[3])
-global_deaths <- read_csv(urls[4])
-global_population <- read_csv(uid_lookup_url)
-
-#view data
-us_cases
-global_cases
-us_deaths
-global_deaths
-global_population
-```
-
-The COVID data sets contain variables such as province/state, country/region, along with other identifiers that do not initially appear to helpful to my analysis. Each date has a corresponding column, which I will pivot into rows to make more time-series friendly. The population data has one row per city/county, represented by the 'Combined_Key' column.
+The shooing incident data set contains columns for the various attributes of a shooting case, such as an incident key, date, location information, and information on the perpetrator, if available. The population data set consists of one row per borough, a grand total, and columns for each year and the percent share of the population for that year. For my analysis, I will only be using population data for the year 2020.
 
 ## Tidy and Transform Data
 
-After taking an initial look at the data, it is evident that some tidying and transformation needs to be done. To start, I will tidy up the global data by pivoting the case and death data and removing some unnecessary columns. I will also filter out all rows where cases are not more than zero, and ensure there is a date column in the correct format.
+After taking an initial look at the data, it is evident that some tidying and transformation needs to be done. To start, I will tidy up the shooting data by removing columns that are unnecessary for this analysis and creating new date and year columns. For the population data, I will remove all unnecessary columns, and estimate the populations for 2023 using a growth rate of 0.3158% per year. The shooting and population data will be merged into one final data frame.
 
-```{r tidy_global_data}
-#pivot and remove unnecessary columns
-global_cases <- global_cases %>%
-  pivot_longer(cols = -c('Province/State',
-                         'Country/Region',
-                         Lat,
-                         Long),
-               names_to = "date",
-               values_to = "cases") %>% 
-  select(-c(Lat, Long))
-
-#pivot and remove unnecessary columns
-global_deaths <- global_deaths %>%
-  pivot_longer(cols = -c('Province/State',
-                         'Country/Region',
-                         Lat,
-                         Long),
-               names_to = "date",
-               values_to = "deaths") %>% 
-  select(-c(Lat, Long))
-
-#join both data sets
-global <- global_cases %>%
-  full_join(global_deaths) %>%
-  filter(cases > 0) %>%
-  rename(Country_Region = 'Country/Region',
-         Province_State = 'Province/State') %>%
-  mutate(date = mdy(date))
-
-#view new data set
-global
-```
-
-The same transformations will be applied to the US data.
-
-```{r tidy_us_data, message = FALSE}
-#pivot and remove unnecessary columns
-us_cases <- us_cases %>%
-  pivot_longer(cols = -c(UID:Combined_Key),
-               names_to = "date",
-               values_to = "cases") %>%
-  select(Admin2:cases) %>%
-  mutate(date = mdy(date)) %>%
-  select(-c(Lat, Long_))
-
-#pivot and remove unnecessary columns
-us_deaths <- us_deaths %>%
-  pivot_longer(cols = -c(UID:Population),
-               names_to = "date",
-               values_to = "deaths") %>%
-  select(Admin2:deaths) %>%
-  mutate(date = mdy(date)) %>%
-  select(-c(Lat, Long_))
-
-#join both data sets
-us <- us_cases %>%
-  full_join(us_deaths) %>%
-  filter(cases > 0) %>%
-  rename(County = "Admin2")
-
-#view new data set
-us
-```
-
-In order to truly compare the US data to the global data, I need to create a mutual column and bring populations into the global data set. The column will be called "Combined_Key", which mimics the same column in the US data.
-
-```{r global_pop}
-#create a final global data set by performing a left join to only bring in relevant population data
-global <- global %>%
-  left_join(global_population, by = c("Province_State", "Country_Region")) %>%
-  select(-c(UID, FIPS)) %>%
-  select(Province_State, Country_Region, date, cases, deaths, Population)
-
-#create combined_key by combining province_state and country_region  
-global <- global %>%
-  unite("Combined_Key",
-        c(Province_State, Country_Region),
-        sep = ", ",
-        na.rm = TRUE,
-        remove = FALSE)
-```
-
-Now that the tidying and transformations are complete, these final data sets can be used for my analysis.
-
-```{r view_data}
-us
-summary(us)
-
-global
-summary(global)
-```
-
-## Exploratory Data Analysis
-
-### Objective #1
-
-For my first objective of determining which US state was most affected by COVID-19, I will summarize cases, deaths, and population by each state and again by the total United States. I will also create variables for cases per million, deaths per million, and mortality rate.
-
-```{r state_summary, message = FALSE}
-#Get total state population
-state_pop <- us %>%
-  distinct(Province_State, County, .keep_all = TRUE) %>%
-  group_by(Province_State) %>%
-  summarize(Population = sum(Population))
-
-#Aggregate cases/deaths
-us_by_state <- us %>%
-  group_by(Country_Region, Province_State, date) %>%
-  summarize(cases = sum(cases),
-            deaths = sum(deaths)) %>%
-  ungroup() %>%
+```{r tidy_data}
+#remove unwanted columns
+nypd_data <- nypd_data %>%
+  select(-c(OCCUR_TIME, LOC_OF_OCCUR_DESC, JURISDICTION_CODE,LOC_CLASSFCTN_DESC, X_COORD_CD, Y_COORD_CD, Latitude, Longitude, Lon_Lat)) %>%
   
-  #bring in population data
-  left_join(state_pop, by = "Province_State") %>%
-  filter(Population > 0) %>%
-  filter(!is.na(Population)) %>%
-  
-  #Create new variables
-  mutate(deaths_per_mill = deaths * 1000000 / Population,
-         cases_per_mill = cases * 1000000 / Population,
-         mortality_rate = deaths/ cases) %>%
-  select(Province_State, date, cases, cases_per_mill, deaths, deaths_per_mill, mortality_rate, Population)
+  #create and format new date columns
+  mutate(DATE = mdy(OCCUR_DATE)) %>%
+  mutate(YEAR = year(DATE)) %>%
+  #remove old date column
+  select(-c(OCCUR_DATE))
 
-#one row per state with accurate totals  
-us_states_ovr <- us_by_state %>%
-  group_by(Province_State) %>%
-  filter(date == max(date)) %>%
-  ungroup() %>%
-  select(Province_State, cases, cases_per_mill, deaths, deaths_per_mill, mortality_rate, Population)
-  
-us_by_state
-us_states_ovr
+#Display final data frame
+head(nypd_data)
 ```
 
-Now I will plot my Death per Million variable to identify the top 10 states that were most affected by the COVID-19 deaths.
+```{r tidy_pop_data}
+#remove unwanted columns
+pop_data <- pop_data %>%
+  select(c(Borough, `2020`)) 
 
-```{r state_mort_rates}
-top_10_states <- us_states_ovr %>%
-  arrange(desc(deaths_per_mill)) %>%
-  head(10)
+#Rename the columns
+colnames(pop_data) <- c('BORO', '2020')
 
-ggplot(top_10_states, aes(x = deaths_per_mill, y = reorder(Province_State, deaths_per_mill))) +
-  geom_point(color = "darkred", size = 3) +
-  labs(title = "COVID-19 Deaths per Million by US State/Province",
-       subtitle = "Top 10",
-       x = "Deaths per Million",
-       y = "State/Province") +
+#Remove the grand total row
+boro_pop <- pop_data[-1, ]
+
+#Change column name to upper case
+boro_pop$BORO <- toupper(boro_pop$BORO)
+
+#Assumed annual population growth rate used to find 2021-2023 populations
+annual_growth_rate = 1.003158
+
+#calculate populations for years 2021-2023
+boro_pop$`2021` <- round(boro_pop$`2020` * annual_growth_rate)
+boro_pop$`2022` <- round(boro_pop$`2021` * annual_growth_rate)
+boro_pop$`2023` <- round(boro_pop$`2022` * annual_growth_rate)
+
+# Perform the pivot
+boro_pop <- boro_pop %>%
+  pivot_longer(
+    cols = starts_with("20"),
+    names_to = "YEAR",
+    values_to = "Population"
+  ) %>%
+  mutate(YEAR = as.numeric(YEAR)) # Convert YEAR from character to numeric
+
+
+#Display final data frame
+head(boro_pop)
+```
+
+```{r merge_data, message = FALSE}
+#Create new dataframe to be used for analysis
+shooting_data <- nypd_data %>%
+  filter(YEAR > 2019) %>%
+  group_by(DATE, YEAR, BORO) %>%
+  summarize(shootings = n(), deaths = sum(STATISTICAL_MURDER_FLAG == TRUE)) %>%
+  inner_join(boro_pop, by = c("BORO" = "BORO", "YEAR" = "YEAR")) %>%
+  select(DATE, YEAR, BORO, shootings, deaths, Population) %>%
+  ungroup()
+
+head(shooting_data)
+```
+
+## Data Analysis
+
+### Objective 1: Which borough had the highest shooting mortality rate?
+
+For my first objective, I will summarize shootings, deaths, and population by each borough. I will also create variables for shootings per one hundred thousand, deaths per one hundred thousand, and mortality rate. It is easier to compare the impact of shootings and deaths across each borough shootings and deaths per one hundred resident to adjust for population differences.
+
+```{r shootings_by_yr, message = FALSE}
+shootings_by_year <- shooting_data %>%
+  group_by(YEAR, BORO, Population) %>%
+  summarize(shootings = sum(shootings), deaths = sum(deaths)) %>%
+  mutate(shootings_per_100k = shootings * 1000000 / Population,
+         deaths_per_100k = deaths * 1000000 / Population,
+         mortality_rate = deaths / shootings) %>%
+  select(YEAR, BORO, shootings, shootings_per_100k, deaths, deaths_per_100k, mortality_rate, Population) %>%
+  ungroup()
+```
+
+```{r gun_violence_vis}
+ggplot(shootings_by_year, aes(x = YEAR, y = mortality_rate, color = BORO)) +
+  geom_point(size = 3) +
+  scale_y_log10() +
+  theme(legend.position="bottom",
+      axis.text.x = element_text(angle = 90)) +
+  labs(title = "NYC Shooting Mortality Rate by Borough",
+     subtitle = "For years 2020-2023",
+     x = "Year",
+     y = "Mortality Rate",
+     color = "Borough") +
   theme_minimal()
 ```
 
-The plot shows that relative to population, Arizona was the state most affected by COVID-19 deaths.
+The plot shows that for the period 2020-2023, Staten Island had the highest shooting mortality rate three out of four years. Due to its small population and low number of total shooting incidents, this could be a misleading statistic without the proper context.
 
-### Objective #2
+### Objective 2: Which borough experienced the most gun violence relative to population?
 
-For my second objective of determining how the US's mortality rate compares to the rest of the world, I will now perform the same summarizations and create the same variables, but instead grouping on a national level. I will have 2 data-frames, one containing time-series data and another with a cumulative total.
-
-```{r us_summary, message = FALSE}
-#Get total US population
-us_pop <- us %>%
-  distinct(Country_Region, Province_State, County, .keep_all = TRUE) %>%
-  group_by(Country_Region) %>%
-  summarize(Population = sum(Population))
-
-#Aggregate cases/deaths
-us_totals <- us %>%
-  group_by(Country_Region, date) %>%
-  summarize(cases = sum(cases),
-            deaths = sum(deaths)) %>%
-  ungroup() %>%
-  
-  #bring in population data
-  left_join(us_pop, by = "Country_Region") %>%
-  filter(Population > 0) %>%
-  filter(!is.na(Population)) %>%
-  
-  #Create new variables
-  mutate(deaths_per_mill = deaths * 1000000 / Population,
-         cases_per_mill = cases * 1000000 / Population,
-         mortality_rate = deaths/ cases) %>%
-  select(Country_Region, date, cases, cases_per_mill, deaths, deaths_per_mill, mortality_rate, Population)
-
-#one row per state with accurate totals 
-us_ovr <- us_totals %>%
-  group_by(Country_Region) %>%
-  filter(date == max(date)) %>%
-  ungroup() %>%
-  select(Country_Region, cases, cases_per_mill, deaths, deaths_per_mill, mortality_rate, Population)
-
-us_totals
-us_ovr
+```{r shootings_total, message = FALSE}
+shootings_total <- shootings_by_year %>%
+  group_by(BORO) %>%
+  summarize(shootings = sum(shootings), deaths = sum(deaths), shootings_per_100k = sum(shootings_per_100k), deaths_per_100k = sum(deaths_per_100k)) %>%
+  mutate(mortality_rate = deaths / shootings) %>%
+  select(BORO, shootings, shootings_per_100k, deaths, deaths_per_100k, mortality_rate) %>%
+  ungroup()
 ```
 
-The same data-frames will now be built using the global data.
-
-```{r global_summary, message = FALSE}
-#Get global populations
-global_pop <- global %>%
-  distinct(Country_Region, Province_State, .keep_all = TRUE) %>%
-  group_by(Country_Region) %>%
-  summarize(Population = sum(Population))
-
-#Aggregate cases/deaths globally
-global_totals <- global %>%
-  group_by(Country_Region, date) %>%
-  summarize(cases = sum(cases),
-            deaths = sum(deaths)) %>%
-  ungroup() %>%
-  
-  #bring in population data
-  left_join(global_pop, by = "Country_Region") %>%
-  filter(Population > 0) %>%
-  filter(!is.na(Population)) %>%
-  
-  #Create new variables
-  mutate(deaths_per_mill = deaths * 1000000 / Population,
-         cases_per_mill = cases * 1000000 / Population,
-         mortality_rate = deaths/ cases) %>%
-  select(Country_Region, date, cases, cases_per_mill, deaths, deaths_per_mill, mortality_rate, Population)
-
-#one row per country with accurate totals
-global_ovr <- global_totals %>%
-  group_by(Country_Region) %>%
-  filter(date == max(date),
-         #Filter out North Korea
-         cases > 1) %>%
-  ungroup() %>%
-  select(Country_Region, cases, cases_per_mill, deaths, deaths_per_mill, mortality_rate, Population)
-
-global_totals
-global_ovr
+```{r deadliest_vis}
+ggplot(shootings_total, aes(x = shootings_per_100k, y = deaths_per_100k, size = mortality_rate, color = BORO)) +
+  geom_point() +
+  geom_text_repel(aes(label = round(mortality_rate, 2)), 
+                  size = 3.5, 
+                  max.overlaps = Inf) +
+  scale_y_log10() +
+  scale_size_continuous(range = c(5, 10), name = "Mortality Rate") +
+  labs(title = "Gun Violence in NYC Boroughs",
+       subtitle = "For years 2020-2023",
+       x = "Shootings per 100k",
+       y = "Deaths per 100k",
+       color = "Borough") +
+  theme_minimal() +
+  guides(size = "none")
 ```
 
-Now that my data-frames are complete, I will merge them together so that the data can be plotted. Since there is a large number of different countries in this data, I will be using a density plot to compare the global COVID-19 mortality rates.
+My analysis has found that the Bronx was the deadliest borough for the years 2020-2023. For this period, it had the most shootings and deaths per one hundred thousand residents, while also having the second highest shooting mortality rate.
 
-```{r global_mort_rates, warning = FALSE}
-#append US summary
-merged_data <- bind_rows(global_ovr, us_ovr)
+## Modeling
 
-#Density plot
-ggplot(merged_data, aes(x = mortality_rate)) +
-  geom_density(fill = "lightblue", alpha = 0.5) +
-  geom_vline(data = subset(merged_data, Country_Region == "US"),
-             aes(xintercept = mortality_rate),
-             color = "red", size = 1.2, linetype = "dashed") +
-  annotate("text",
-           x = subset(merged_data, Country_Region == "US")$mortality_rate,
-           y = Inf,
-           label = "USA",
-           vjust = 8,
-           hjust = -.5,
-           color = "red") +
-  labs(title = "Global COVID-19 Mortality Rate Distribution",
-       x = "Mortality Rate",
-       y = "Density") +
-  scale_x_log10() +
-  theme_minimal()
-```
+### Objective 3: Can we predict 2023 shootings using an ARIMA model?
 
-The density plot shows that the US has a COVID-19 mortality rate slightly above 1%, which appears to be in line with the global average rate.
+For my third and final objective, I will use an ARIMA model to predict shooting incidents for the year 2023. The model will be trained using the data from 2020-2022, and the predicted shooting incidents will be compared to the actual shooting incidents.
 
-### Objective 3
+```{r model_shootings}
+# Filter and aggregate model
+model_data <- nypd_data %>%
+  filter(YEAR > 2019) %>%
+  group_by(DATE) %>%
+  summarize(shootings = n(), deaths = sum(STATISTICAL_MURDER_FLAG == TRUE)) %>%
+  select(DATE, shootings, deaths) %>%
+  filter(shootings > 0) %>%
+  ungroup()
 
-For my third and final objective, I will feed the 'US Totals' data-frame into an ARIMA model to predict COVID-19 deaths during the first quarter of 2023. The model will be trained using the data from 2020-2022, and the predicted deaths will be compared to the actual deaths for the first quarter of 2023.
+# Aggregate data weekly
+weekly_data <- model_data %>%
+  mutate(week = floor_date(DATE, "week")) %>%
+  group_by(week) %>%
+  summarize(shootings = sum(shootings)) %>%
+  filter(week < as.Date("2024-01-01"))
 
-```{r model_deaths}
-#Filter out days with 0 deaths
-model_data <- us_totals %>%
-  filter(deaths > 0) %>%
-  select(date, deaths)
+# Convert weekly data to time series (starting from the first week of 2020)
+ts_weekly <- ts(weekly_data$shootings, start = c(2020, 1), frequency = 52)
 
-# Split data into training (2020-2022) and testing (2023)
-train_data <- model_data %>% filter(date < as.Date("2023-01-01"))
-test_data <- model_data %>% filter(date >= as.Date("2023-01-01"))
-
-
-# Convert training data to time series object
-ts_train <- ts(train_data$deaths, start = c(2020, 1), frequency = 365)
-
-# Convert testing data to time series object
-ts_test <- ts(test_data$deaths, start = c(2023, 1), frequency = 365)
-
-# Apply 2nd Differencing on training data for stationarity
-diff_train <- diff(diff(ts_train))
-
-# p-value is greater than .05, stationarity achieved
-adf.test(diff_train)
+# Split the data into training (2020-2022) and testing (2023) sets
+train_data <- window(ts_weekly, end = c(2022, 52))
+test_data <- window(ts_weekly, start = c(2023, 1), end = c(2023, 52))
 
 # Fit ARIMA model to training data only
-arima_model <- auto.arima(diff_train)
+arima_model <- auto.arima(train_data)
 summary(arima_model)
 
-# Forecast for the length of the testing set
-forecasted <- forecast(arima_model, h = length(ts_test))
+# Forecast for the testing period
+forecasted <- forecast(arima_model, h = length(test_data))
 
-# Reverse differencing for testing period
-forecasted_differences <- as.numeric(forecasted$mean)
-first_cumsum <- cumsum(forecasted_differences) + as.numeric(tail(diff(ts_train), n = 1))
-original_scale_predictions <- cumsum(first_cumsum) + as.numeric(tail(ts_train, n = 1))
-
-# Create results data frame for predictions
+# Create dates for predicted results
 predicted_dates <- seq(
   from = as.Date("2023-01-01"),
-  by = "day",
-  length.out = length(original_scale_predictions)
+  by = "week",
+  length.out = length(test_data)
 )
 
-#Actual deaths for 2020-2022
-actual_deaths <- model_data %>%
-  filter(date <= as.Date("2022-12-31"))
-
-#Combine actual and predicted deaths
-comparison <- bind_rows(
-  train_data %>% filter(date >= as.Date("2023-01-01")),  # Keep actual deaths for 2023
-  data.frame(date = predicted_dates, deaths = test_data$deaths, predicted_deaths = original_scale_predictions)) %>%
-  filter(year(date) == 2023)  # Filter to include only 2023 data
-
-#Plot predicted vs actual deaths
-ggplot(comparison, aes(x = date)) +
-  geom_line(aes(y = deaths, color = "Actual"), size = 1, na.rm = TRUE) +
-  geom_line(aes(y = predicted_deaths, color = "Predicted"), size = 1, na.rm = TRUE) +
-  scale_color_manual(values = c("Actual" = "black", "Predicted" = "red")) +
+# Plot predicted vs actual shootings
+ggplot() +
+  geom_line(data = weekly_data, aes(x = week, y = shootings, color = "Actual"), size = 1) +
+  geom_line(aes(x = predicted_dates, y = as.numeric(forecasted$mean), color = "Predicted (2023)"), size = 1) +
+  scale_color_manual(values = c("Actual" = "black", "Predicted (2023)" = "red")) +
   labs(
-    title = "Actual vs Predicted COVID-19 Deaths",
-    subtitle = "Using ARIMA with Differencing (Trained on 2020-2022, Tested on 2023)",
+    title = "Actual vs Predicted Weekly NYC Shootings",
+    subtitle = "Using ARIMA Model (Trained on 2020-2022, Tested on 2023)",
     x = "Date",
-    y = "Daily Deaths",
-    color = "Legend") +
+    y = "Weekly Shootings",
+    color = "Legend"
+  ) +
   theme_minimal()
 ```
 
-## Conclusion
+## Bias Identification
 
-By using the data sets from Johns Hopkins University, I was able to complete all my objectives. However, it is important to discuss potential biases in my analysis. There are many factors that influence COVID-19 cases, deaths, and by association, mortality rates. the data sets provided do not account for variables such as government policy, vaccine rates, or the time between diagnosis and death (lag). In the United States, these variables would be different across both states and cities. Globally, many countries had very strict COVID-19 policies, while many countries did not have much policy at all. When interpreting the results of my analysis, it is important to remember that the data does not account for these types of variables, making my findings more exploratory than factual.
+A potential bias in my analysis is that additional variables used to predict shootings incidents were not used. The original data set included different variables, such as location, time of day, and gender, however these variables were not consistently reported. Another potential variable that could influence the number of shooting incidents, would be the law enforcement population. If the number of police officers fluctuates year to year, the crime rate could be expected to reasonably fluctuate as well. For example, there were lock downs and social distancing measures introduced during 2020 and 2021 that could have reduced the law enforcement population. Incident reporting tendencies could have also changed during that time period, and are liable to change year to year. There are numerous factors that can directly contribute to a shooting incident and how/when it is reported.
